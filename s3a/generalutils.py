@@ -91,10 +91,6 @@ def largestList(verts: List[XYVertices]) -> XYVertices:
 
 def augmentException(ex: Exception, prependedMsg: str):
   exMsg = str(ex)
-  if fns.usingPostponedErrors:
-    # Escape for qt dialog box
-    prependedMsg = html.escape(prependedMsg)
-    exMsg = html.escape(exMsg)
   ex.args = (prependedMsg + exMsg,)
 
 def lower_NoSpaces(name: str):
@@ -216,7 +212,7 @@ def getCroppedImg(image: NChanImg, verts: np.ndarray, margin=0, *otherBboxes: np
   """
   Crops an image according to the specified vertices such that the returned image does not extend
   past vertices plus margin (including other bboxes if specified). All bboxes and output coords
-  are of the form [[xmin, xmax], [ymin, ymax]]. Slices are (row slices, col slices) if `coordsAsSlices`
+  are of the form [[xmin, ymin], [xmax, ymax]]. Slices are (row slices, col slices) if `coordsAsSlices`
   is specified.
   """
   verts = np.vstack(verts)
@@ -378,3 +374,6 @@ class classproperty:
 
   def __get__(self, owner_self, owner_cls):
     return self.fget(owner_cls)
+
+def imgPathtoHtml(imgPath: FilePath, width=150):
+  return '<img src="' + str(imgPath) + f'" width="{width}px">'
