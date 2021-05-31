@@ -69,7 +69,8 @@ class MainImagePlugin(ParamEditorPlugin):
           disp.reflectSelectionBoundsMade(verts, self.win.vertsPlg.region)
           disp.reflectSelectionBoundsMade(verts, clearExisting=False)
 
-        selection = pd.unique(win.compTbl.ids_rows_colsFromSelection(warnNoneSelection=False)[:,0])
+        nonUniqueIds = win.compTbl.ids_rows_colsFromSelection(excludeNoEditCols=False, warnNoneSelection=False)[:,0]
+        selection = pd.unique(nonUniqueIds)
         win.compTbl.sigSelectionChanged.emit(selection)
 
     win.sharedAttrs.generalProps.registerProp(CNST.PROP_MIN_COMP_SZ, container=self.props)
@@ -192,7 +193,7 @@ class HelpPlugin(ParamEditorPlugin):
 
   def attachWinRef(self, win: QtWidgets.QMainWindow):
     super().attachWinRef(win)
-    self.registerFunc(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl('https://gitlab.com/ficsresearch/s3a/-/wikis/home')),
+    self.registerFunc(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl('https://gitlab.com/ficsresearch/s3a/-/wikis/docs/user\'s-guide')),
                          name='Online User Guide')
     self.registerFunc(lambda: QtWidgets.QMessageBox.aboutQt(win, 'About Qt'), name='About Qt')
     self.registerFunc(self.iconAttributions_gui, name='Icon Attributions')
