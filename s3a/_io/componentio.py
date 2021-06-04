@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import errno
 import inspect
 import json
+import os
 import pickle
 import sys
 import tempfile
-from ast import literal_eval
 from collections import defaultdict
 from contextlib import ExitStack
 from functools import wraps
@@ -17,25 +18,27 @@ from zipfile import ZipFile
 import cv2 as cv
 import numpy as np
 import pandas as pd
-from skimage import io, draw
-from skimage.exposure import rescale_intensity
-from s3a.shims import typing_extensions
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-
-from s3a.constants import REQD_TBL_FIELDS as RTF, PRJ_ENUMS
+from s3a.constants import REQD_TBL_FIELDS as RTF, PRJ_ENUMS, IO_TEMPLATES_DIR
 from s3a.generalutils import augmentException, getCroppedImg, resize_pad, cvImsave_rgb, orderContourPts, classproperty, \
-  cvImread_rgb, imgPathtoHtml
+  cvImread_rgb, imgPathtoHtml, deprecateKwargs, DirectoryDict
 from s3a.parameditors.table import TableData
-from s3a.structures import PrjParamGroup, FilePath, GrayImg, \
-  ComplexXYVertices, PrjParam, XYVertices, AnnParseError
+from s3a.shims import typing_extensions
+from s3a.structures import FilePath, GrayImg, \
+  ComplexXYVertices, PrjParam, AnnParseError
+from skimage import draw
+from skimage.exposure import rescale_intensity
 from utilitys import fns
 from utilitys.fns import warnLater
+
+from .helpers import serialize, deserialize
 
 FilePathOrDf = Union[FilePath, pd.DataFrame]
 # Values are strings
 # noinspection PyTypeHints
 _litLst = typing_extensions.Literal[PRJ_ENUMS.IO_IMPORT, PRJ_ENUMS.IO_EXPORT]
+
 
 def _attrNameFmt(buildOrExport: _litLst, obj):
   def membership(el):
@@ -43,6 +46,7 @@ def _attrNameFmt(buildOrExport: _litLst, obj):
       if el.endswith(exclude):
         return False
     return el.startswith(buildOrExport)
+
   attrs = [attr.replace(buildOrExport, '') for attr in vars(obj) if membership(attr)]
   out = {}
   for attr in attrs:
@@ -50,6 +54,7 @@ def _attrNameFmt(buildOrExport: _litLst, obj):
     fileFmt = descrFmt.replace(' ', '.').lower()
     out[fileFmt] = descrFmt + ' Files'
   return out
+
 
 def _getImg_mapping_offset(inFileOrImg: Union[FilePath, GrayImg]):
   if isinstance(inFileOrImg, np.ndarray):
@@ -71,7 +76,13 @@ def _getImg_mapping_offset(inFileOrImg: Union[FilePath, GrayImg]):
   # No extra metadata
   return image, None, None
 
-def _writeImge_meta(outImg: np.ndarray, saveName: FilePath, mapping: pd.Series=None, offset: int=None):
+
+def _writeImge_meta(
+    outImg: np.ndarray,
+    saveName: FilePath,
+    mapping: pd.Series = None,
+    offset: int = None,
+):
   outImg = Image.fromarray(outImg)
   info = PngInfo()
   if mapping is not None:
@@ -81,50 +92,27 @@ def _writeImge_meta(outImg: np.ndarray, saveName: FilePath, mapping: pd.Series=N
     info.add_text('offset', str(offset))
   outImg.save(saveName, pnginfo=info)
 
+
 def _getPdExporters():
   members = inspect.getmembers(
-    pd.DataFrame, lambda meth: inspect.isfunction(meth) and meth.__name__.startswith('to_'))
+      pd.DataFrame, lambda meth: inspect.isfunction(meth) and meth.__name__.startswith('to_')
+  )
   return [mem[0].replace('to_', '') for mem in members]
+
+
 def _getPdImporters():
   members = inspect.getmembers(
-    pd.DataFrame,lambda meth: inspect.isfunction(meth) and meth.__name__.startswith('read_'))
+      pd.DataFrame, lambda meth: inspect.isfunction(meth) and meth.__name__.startswith('read_')
+  )
   return [mem[0].replace('read_', '') for mem in members]
 
-def _strSerToParamSer(strSeries: pd.Series, paramVal: Any) -> pd.Series:
-  paramType = type(paramVal)
-  # TODO: Move this to a more obvious place?
-  funcMap = {
-    # Format string to look like a list, use ast to convert that string INTO a list, make a numpy array from the list
-    np.ndarray        : lambda strVal: np.array(literal_eval(strVal)),
-    ComplexXYVertices : ComplexXYVertices.deserialize,
-    XYVertices        : XYVertices.deserialize,
-    bool              : lambda strVal: strVal.lower() == 'true',
-    PrjParam          : lambda strVal: PrjParamGroup.fieldFromParam(paramVal.group, strVal)
-  }
-  defaultFunc = lambda strVal: paramType(strVal)
-  funcToUse = funcMap.get(paramType, defaultFunc)
-  return strSeries.apply(funcToUse).values
-
-
-def _paramSerToStrSer(paramSer: pd.Series, paramVal: Any) -> pd.Series:
-  # TODO: Move along with above function?
-  paramType = type(paramVal)
-  funcMap = {
-    # Format string to look like a list, use ast to convert that string INTO a list, make a numpy array from the list
-    np.ndarray: lambda param: str(param.tolist()),
-    XYVertices: XYVertices.serialize,
-    ComplexXYVertices: ComplexXYVertices.serialize,
-  }
-  defaultFunc = lambda param: str(param)
-
-  funcToUse = funcMap.get(paramType, defaultFunc)
-  return paramSer.apply(funcToUse)
 
 # Credit: https://stackoverflow.com/a/28238047/9463643
 # class classorinstancemethod(classmethod):
 #   def __get__(self, instance, type_):
 #     descr_get = super().__get__ if instance is None else self.__func__.__get__
 #     return descr_get(instance, type_)
+
 
 class ComponentIO:
   """
@@ -156,7 +144,8 @@ class ComponentIO:
 
   def __init__(self):
     # Propagate custom defaults to each desired function
-    for typeDict, fnType in zip([self.importTypes, self.exportTypes], [PRJ_ENUMS.IO_IMPORT, PRJ_ENUMS.IO_EXPORT]):
+    for typeDict, fnType in zip([self.importTypes, self.exportTypes],
+                                [PRJ_ENUMS.IO_IMPORT, PRJ_ENUMS.IO_EXPORT]):
       for fileExt in typeDict:
         func = self._ioFnFromFileType(fileExt, fnType)
         setattr(self, func.__name__, self._ioWrapper(func))
@@ -177,8 +166,24 @@ class ComponentIO:
     """
     return _attrNameFmt(PRJ_ENUMS.IO_IMPORT, cls)
 
+  def _getForeignTableData(self, ioFuncName: str):
+    """Returns a TableData object responsible for importing / exporting data of this format"""
+    out = TableData(IO_TEMPLATES_DIR / (ioFuncName.lower() + '.tblcfg'))
+    # Make sure current factories from plugins still work
+    for field in list(RTF):
+      factory = field.opts.get('factory')
+      if factory:
+        out.addFieldFactory(field, factory)
+    return out
+
   @classmethod
-  def ioFileFilter(cls, which=PRJ_ENUMS.IO_ROUND_TRIP, typeFilter='', allFilesOpt=True, **extraOpts):
+  def ioFileFilter(
+      cls,
+      which=PRJ_ENUMS.IO_ROUND_TRIP,
+      typeFilter='',
+      allFilesOpt=True,
+      **extraOpts,
+  ):
     """
     Helper for creating a file filter out of the handled IO types. The returned list of
     strings is suitable for inserting into a QFileDialog.
@@ -190,9 +195,9 @@ class ComponentIO:
     :param extraOpts; Extra file types to include in the filter
     """
     ioDict = {
-      PRJ_ENUMS.IO_ROUND_TRIP: cls.roundTripTypes,
-      PRJ_ENUMS.IO_IMPORT: cls.importTypes,
-      PRJ_ENUMS.IO_EXPORT: cls.exportTypes
+        PRJ_ENUMS.IO_ROUND_TRIP: cls.roundTripTypes,
+        PRJ_ENUMS.IO_IMPORT: cls.importTypes,
+        PRJ_ENUMS.IO_EXPORT: cls.exportTypes
     }[which]
     if isinstance(typeFilter, str):
       typeFilter = [typeFilter]
@@ -206,7 +211,10 @@ class ComponentIO:
 
   def _ioWrapper(self, func: Callable):
     """Wraps build and export functions to provide defaults specified by build/exportOpts before the function call"""
-    which = PRJ_ENUMS.IO_IMPORT if func.__name__.startswith(PRJ_ENUMS.IO_IMPORT) else PRJ_ENUMS.IO_EXPORT
+    which = PRJ_ENUMS.IO_IMPORT if func.__name__.startswith(
+        PRJ_ENUMS.IO_IMPORT
+    ) else PRJ_ENUMS.IO_EXPORT
+
     @wraps(func)
     def wrapper(*args, **kwargs):
       useOpts = self.importOpts if which is PRJ_ENUMS.IO_IMPORT else self.exportOpts
@@ -216,14 +224,19 @@ class ComponentIO:
 
     return wrapper
 
-  def exportByFileType(self, compDf: pd.DataFrame, outFile: Union[str, Path], verifyIntegrity=True, **exportArgs):
+  def exportByFileType(
+      self,
+      compDf: pd.DataFrame,
+      outFile: Union[str, Path],
+      verifyIntegrity=True,
+      **exportArgs,
+  ):
     outFile = Path(outFile)
     outFn = self._ioFnFromFileType(outFile, PRJ_ENUMS.IO_EXPORT)
 
     ret = outFn(compDf, outFile, **exportArgs)
     if verifyIntegrity and outFile.suffix[1:] in self.roundTripTypes:
-      matchingCols = np.setdiff1d(compDf.columns, [RTF.INST_ID,
-                                                   RTF.SRC_IMG_FILENAME])
+      matchingCols = np.setdiff1d(compDf.columns, [RTF.INST_ID, RTF.SRC_IMG_FILENAME])
       loadedDf = self.importByFileType(outFile)
       # For some reason, there are cases in which numy comparison spots false errors and cases where
       # pandas spots false errors. Only a problem if both see problms
@@ -236,28 +249,31 @@ class ComponentIO:
         dfB = compDf[matchingCols]
         for ii in range(len(dfA)):
           for jj in range(len(dfA.columns)):
-            if not np.array_equal(dfA.iat[ii, jj], dfB.iat[ii,jj]):
+            if not np.array_equal(dfA.iat[ii, jj], dfB.iat[ii, jj]):
               problemCells[compDf.at[dfB.index[ii], RTF.INST_ID]].append(str(matchingCols[jj]))
         # The only way to prevent "truth value of array is ambiguous" is cell-by-cell iteration
         problemMsg = [f'{idx}: {cols}' for idx, cols in problemCells.items()]
         problemMsg = '\n'.join(problemMsg)
         # Try to fix the problem with an iloc write
-        warnLater('<b>Warning!</b> Saved components do not match current component'
-             ' state. This can occur when pandas incorrectly caches some'
-             ' table values. Problem cells (shown as [id]: [columns]):\n'
-             + f'{problemMsg}\n'
-               f'Please try manually altering these values before exporting again.', UserWarning)
+        warnLater(
+            '<b>Warning!</b> Saved components do not match current component'
+            ' state. This can occur when pandas incorrectly caches some'
+            ' table values. Problem cells (shown as [id]: [columns]):\n' + f'{problemMsg}\n'
+            f'Please try manually altering these values before exporting again.', UserWarning
+        )
     return ret
 
-  def importByFileType(self, inFile: Union[str, Path], imShape: Tuple[int]=None,
-                      strColumns=False, **importArgs):
+  def importByFileType(
+      self, inFile: Union[str, Path], imShape: Tuple[int] = None, strColumns=False, **importArgs
+  ):
     buildFn = self._ioFnFromFileType(inFile, PRJ_ENUMS.IO_IMPORT)
     outDf = buildFn(inFile, imShape=imShape, **importArgs)
     if strColumns:
       outDf.columns = list(map(str, outDf.columns))
     return outDf
 
-  def _ioFnFromFileType(self, fpath: Union[str, Path],
+  def _ioFnFromFileType(self,
+                        fpath: Union[str, Path],
                         buildOrExport=_litLst,
                         missingOk=False) -> Optional[Callable]:
     fpath = Path(fpath)
@@ -267,21 +283,22 @@ class ComponentIO:
     if not any(typIdx):
       raise IOError(f'Not sure how to handle file {fpath.name}')
     fnNameSuffix = cmpTypes[typIdx][-1].title().replace('.', '')
-    outFn: Callable =  getattr(self, buildOrExport + fnNameSuffix, None)
+    outFn: Callable = getattr(self, buildOrExport + fnNameSuffix, None)
     if outFn is None and not missingOk:
       raise ValueError(f'Full I/O specification missing for type {fnNameSuffix}')
     return outFn
 
-  def _pandasSerialImport(self, inFileOrDf: Union[str, Path, pd.DataFrame],
-                          **pdImportArgs):
+  def _pandasSerialImport(self, inFileOrDf: Union[str, Path, pd.DataFrame], **pdImportArgs):
     if isinstance(inFileOrDf, pd.DataFrame):
       serialDf = inFileOrDf
     else:
       fType = Path(inFileOrDf).suffix.lower().replace('.', '')
       importFn = getattr(pd, f'read_{fType}', None)
       if importFn is None:
-        raise ValueError(f'File type {fType} cannot be handled by the serial importer.'
-                         f' Must be one of {",".join(_getPdImporters())}')
+        raise ValueError(
+            f'File type {fType} cannot be handled by the serial importer.'
+            f' Must be one of {",".join(_getPdImporters())}'
+        )
       # Special case: csv imports need to avoid interpreting nan results
       pdImportArgs.update(na_filter=False, dtype=str)
       acceptedArgs = inspect.signature(importFn).parameters
@@ -289,15 +306,20 @@ class ComponentIO:
       serialDf = importFn(inFileOrDf, **{k: pdImportArgs[k] for k in useArgs})
     return serialDf
 
-  def _pandasSerialExport(self, exportDf: pd.DataFrame, outFile: Union[str, Path]=None,
-                          readOnly=True, **pdExportArgs):
+  def _pandasSerialExport(
+      self,
+      exportDf: pd.DataFrame,
+      outFile: Union[str, Path] = None,
+      readOnly=True,
+      **pdExportArgs
+  ):
     if outFile is None:
       return
 
     defaultExportParams = {
-      'na_rep': 'NaN',
-      'float_format': '{:0.10n}',
-      'index': False,
+        'na_rep': 'NaN',
+        'float_format': '{:0.10n}',
+        'index': False,
     }
     outPath = Path(outFile)
     outPath.parent.mkdir(exist_ok=True, parents=True)
@@ -306,19 +328,22 @@ class ComponentIO:
     defaultExportParams.update(pdExportArgs)
     exportFn = getattr(exportDf, f'to_{exporter}', None)
     if exportFn is None:
-      raise ValueError(f'Exporter {exporter} not recognized. Acceptable options:\n'
-                       + ', '.join(_getPdExporters()))
+      raise ValueError(
+          f'Exporter {exporter} not recognized. Acceptable options:\n' +
+          ', '.join(_getPdExporters())
+      )
 
     with np.printoptions(threshold=sys.maxsize):
       exportFn(outFile, index=False)
     if readOnly:
-      outPath.chmod(S_IREAD|S_IRGRP|S_IROTH)
+      outPath.chmod(S_IREAD | S_IRGRP | S_IROTH)
 
   # -----
   # Export options
   # -----
-  def exportSerialized(self, compDf: pd.DataFrame, outFile: Union[str, Path]=None,
-                       readOnly=True, **pdExportArgs):
+  def exportSerialized(
+      self, compDf: pd.DataFrame, outFile: Union[str, Path] = None, readOnly=True, **pdExportArgs
+  ):
     """
     Converts dataframe into a string-serialized version and uses pandas to write it to disk.
 
@@ -348,7 +373,10 @@ class ComponentIO:
       exportDf = compDf.copy(deep=True)
       for col in exportDf:
         if not isinstance(col.value, str):
-          exportDf[col] = _paramSerToStrSer(exportDf[col], col.value)
+          serial, errs = serialize(col, exportDf[col])
+          exportDf[col] = serial.to_numpy()
+          if len(errs):
+            raise ValueError(f'Encountered errors on the following rows:\n{errs.to_string()}')
       self._pandasSerialExport(exportDf, outFile, readOnly, **pdExportArgs)
     except Exception as ex:
       errMsg = f'Error on parsing column "{col.name}"\n'
@@ -361,19 +389,30 @@ class ComponentIO:
     """Exposed format from the more general exportSerialized"""
     return self.exportSerialized(*args, **kwargs)
 
-  def exportCompImgsDf(self, compDf: pd.DataFrame, outFile: Union[str, Path]=None,
-                       imgDir: FilePath=None, margin=0, marginAsPct=False,
-                       includeCols=('instId', 'img', 'labelMask', 'label', 'offset'),
-                       lblField='Instance ID', asIndiv=False,
-                       returnLblMapping=False,
-                       missingOk=False, **kwargs):
+  @deprecateKwargs(imgDir='srcDir')
+  def exportCompImgsDf(
+      self,
+      compDf: pd.DataFrame,
+      outFile: Union[str, Path] = None,
+      *,
+      srcDir: Union[FilePath, dict, DirectoryDict] = None,
+      margin=0,
+      marginAsPct=False,
+      includeCols=('instId', 'img', 'labelMask', 'label', 'offset'),
+      lblField='Instance ID',
+      asIndiv=False,
+      returnLblMapping=False,
+      missingOk=False,
+      **kwargs
+  ):
     """
     Creates a dataframe consisting of extracted images around each component
     :param compDf: Dataframe to export
     :param outFile: Where to save the result, if it should be saved. Caution -- this
       is currently a time-consuming process!
-    :param imgDir: Where images corresponding to this dataframe are kept. Source image
-      filenames are interpreted relative to this directory if they are not absolute.
+    :param srcDir: Where images corresponding to this dataframe are kept. Source image
+      filenames are interpreted relative to this directory if they are not absolute. Alternatively, can be a dict
+      of {name: np.ndarray} image mappings
     :param margin: How much padding to give around each component
     :param marginAsPct: Whether the margin should be a percentage of the component size or
       a raw pixel value.
@@ -400,21 +439,12 @@ class ComponentIO:
     """
     bgColor = kwargs.get('bgColor', 0)
     _imgCache = {}
-    if imgDir is None:
-      imgDir = Path('.')
-    else:
-      imgDir = Path(imgDir)
+    if srcDir is None:
+      srcDir = Path('.')
+    srcDir = DirectoryDict(srcDir, allowAbsolute=True, readFunc=cvImread_rgb)
     uniqueImgs = np.unique(compDf[RTF.SRC_IMG_FILENAME])
     dfGroupingsByImg = []
     for imgName in uniqueImgs:
-      fullImgName = Path(imgName)
-      if not fullImgName.is_absolute():
-        fullImgName = imgDir / fullImgName
-      if fullImgName not in _imgCache:
-        if not fullImgName.exists() and missingOk:
-          _imgCache[fullImgName] = None
-        else:
-          _imgCache[fullImgName] = io.imread(fullImgName)
       dfGroupingsByImg.append(compDf[compDf[RTF.SRC_IMG_FILENAME] == imgName])
 
     useKeys = set(includeCols)
@@ -424,25 +454,23 @@ class ComponentIO:
     kwargs.pop('imShape', None)
     mappings = {}
     for miniDf, fullImgName in zip(dfGroupingsByImg, uniqueImgs):
-      fullImgName = imgDir / fullImgName
-      img = _imgCache[fullImgName]
+      img = srcDir.get(fullImgName)
+      if img is None and not missingOk:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), fullImgName)
       shape = img if img is None else img.shape[:2]
-      lblImg, mapping = self.exportLblPng(miniDf,
-                                          imShape=shape,
-                                          lblField=lblField,
-                                          returnLblMapping=True,
-                                          **kwargs)
-      mappings[fullImgName.name] = mapping
+      lblImg, mapping = self.exportLblPng(
+          miniDf, imShape=shape, lblField=lblField, returnLblMapping=True, **kwargs
+      )
+      mappings[Path(fullImgName).name] = mapping
       if img is None:
         img = np.zeros_like(lblImg)
       invertedMap = pd.Series(mapping.index, mapping)
-
 
       for ii, (idx, row) in enumerate(miniDf.iterrows()):
         allVerts = row[RTF.VERTICES].stack()
         if marginAsPct:
           compImgSz = allVerts.max(0) - allVerts.min(0)
-          marginToUse = (compImgSz*(margin/100)).astype(int)
+          marginToUse = (compImgSz * (margin/100)).astype(int)
         else:
           marginToUse = margin
         compImg, bounds = getCroppedImg(img, allVerts, marginToUse, coordsAsSlices=False)
@@ -456,15 +484,15 @@ class ComponentIO:
 
         # x-y to row-col, transpose to get min-max in axis 0 and row-col in axis 1
         indexer = tuple(slice(*b) for b in bounds[:, ::-1].T)
-        xyOffset = bounds[0,:]
+        xyOffset = bounds[0, :]
         if lblImg.ndim > 2:
-          indexer += (...,)
+          indexer += (..., )
         if 'labelMask' in useKeys:
           mask = lblImg[indexer]
           if asIndiv:
             # Only color in this id's region. Since it might've been covered over by a different ID, regenerate the
             # mask from vertices, taking margin into account
-            colorVerts = ComplexXYVertices([allVerts - bounds[0,:]])
+            colorVerts = ComplexXYVertices([allVerts - bounds[0, :]])
             mask = np.full_like(mask, bgColor)
             # 'Float' works for int and float orig values, required since opencv complains about some numpy
             # dtypes
@@ -488,7 +516,12 @@ class ComponentIO:
       return outDf, mappings
     return outDf
 
-  def exportPkl(self, compDf: pd.DataFrame, outFile: Union[str, Path]=None, **exportArgs) -> (Any, str):
+  def exportPkl(
+      self,
+      compDf: pd.DataFrame,
+      outFile: Union[str, Path] = None,
+      **exportArgs,
+  ) -> (Any, str):
     """
     See the function signature for :func:`exportCsv <ComponentIO.exportCsv>`
     """
@@ -499,11 +532,18 @@ class ComponentIO:
       compDf.to_pickle(outFile)
     return pklDf
 
-  def exportLblPng(self, compDf: pd.DataFrame, outFile: FilePath=None, imShape: Tuple[int]=None,
-                   lblField: Union[PrjParam, str]='Instance ID', bgColor=0,
-                   rescaleOutput=False, returnLblMapping=False,
-                   writeMeta=True,
-                   **kwargs):
+  def exportLblPng(
+      self,
+      compDf: pd.DataFrame,
+      outFile: FilePath = None,
+      imShape: Tuple[int] = None,
+      lblField: Union[PrjParam, str] = 'Instance ID',
+      bgColor=0,
+      rescaleOutput=False,
+      returnLblMapping=False,
+      writeMeta=True,
+      **kwargs
+  ):
     """
     :param compDf: Dataframe to export
     :param outFile: Filename to save, leave *None* to avoid saving to a file
@@ -549,10 +589,14 @@ class ComponentIO:
     if rescaleOutput:
       if mapping is not None:
         max_ = np.max(np.asarray(mapping.index), initial=bgColor)
-        mapping.index = rescale_intensity(mapping.index, in_range=(bgColor, max_), out_range='uint16')
+        mapping.index = rescale_intensity(
+            mapping.index, in_range=(bgColor, max_), out_range='uint16'
+        )
       else:
         max_ = np.max(labels_numeric, initial=bgColor)
-      labels_numeric = rescale_intensity(labels_numeric, in_range=(bgColor, max_), out_range='uint16')
+      labels_numeric = rescale_intensity(
+          labels_numeric, in_range=(bgColor, max_), out_range='uint16'
+      )
 
     if imShape is None:
       # Without any components the image is non-existant
@@ -581,12 +625,15 @@ class ComponentIO:
   #   # Create label to output mapping
   #   return self.exportLblPng(compDf, outFile, imShape, 'Class', **kwargs)
 
-  def exportCompImgsZip(self, compDf: pd.DataFrame,
-                        outDir:FilePath='s3a-export',
-                        resizeShape: Tuple[int, int]=None,
-                        archive=False,
-                        makeSummary=False,
-                        **kwargs):
+  def exportCompImgsZip(
+      self,
+      compDf: pd.DataFrame,
+      outDir: FilePath = 's3a-export',
+      resizeShape: Tuple[int, int] = None,
+      archive=False,
+      makeSummary=False,
+      **kwargs
+  ):
     """
     From a component dataframe, creates output directories for component images and masks.
     This is useful for many neural networks etc. to read individual component images.
@@ -614,26 +661,28 @@ class ComponentIO:
     with ExitStack() as stack:
       if archive:
         useDir = Path(stack.enter_context(tempfile.TemporaryDirectory()))
-      dataDir = useDir/'data'
-      labelsDir= useDir/'labels'
+      dataDir = useDir / 'data'
+      labelsDir = useDir / 'labels'
       dataDir.mkdir(exist_ok=True, parents=True)
       labelsDir.mkdir(exist_ok=True, parents=True)
 
-      summaryName = useDir/'summary.html'
+      summaryName = useDir / 'summary.html'
 
       extractedImgs = self.exportCompImgsDf(compDf, None, **kwargs)
       for idx, row in extractedImgs.iterrows():
         saveName = f'{row.instId}.png'
-        saveFn(dataDir/saveName, row.img)
-        saveFn(labelsDir/saveName, row.labelMask)
+        saveFn(dataDir / saveName, row.img)
+        saveFn(labelsDir / saveName, row.labelMask)
 
       if makeSummary:
         extractedImgs = extractedImgs.rename({'instId': RTF.INST_ID}, axis=1)
-        outDf: pd.DataFrame = compDf.drop([RTF.VERTICES], axis=1).merge(extractedImgs, on=RTF.INST_ID)
+        outDf: pd.DataFrame = compDf.drop([RTF.VERTICES], axis=1).merge(
+            extractedImgs, on=RTF.INST_ID
+        )
         for colName, imgDir in zip(['labelMask', 'img'], [labelsDir, dataDir]):
           relDir = imgDir.relative_to(useDir)
           outDf[colName] = outDf[RTF.INST_ID].apply(
-            lambda el: imgPathtoHtml((relDir/str(el)).with_suffix('.png').as_posix())
+              lambda el: imgPathtoHtml((relDir / str(el)).with_suffix('.png').as_posix())
           )
         outDf.columns = list(map(str, outDf.columns))
         outDf.to_html(summaryName, escape=False, index=False)
@@ -651,8 +700,14 @@ class ComponentIO:
   # -----
   # Import options
   # -----
-  def convert(self, fromData: FilePathOrDf, toFile: FilePath, doExport=True, importArgs: dict=None,
-              exportArgs: dict=None):
+  def convert(
+      self,
+      fromData: FilePathOrDf,
+      toFile: FilePath,
+      doExport=True,
+      importArgs: dict = None,
+      exportArgs: dict = None
+  ):
     if importArgs is None:
       importArgs = {}
     if exportArgs is None:
@@ -665,8 +720,14 @@ class ComponentIO:
     return exportFn(fromData, toFile, **exportArgs)
 
   @fns.dynamicDocstring(availImporters=_getPdImporters())
-  def importSerialized(self, inFileOrDf: FilePathOrDf, imShape: Tuple=None,
-                          reindex=False, **importArgs):
+  def importSerialized(
+      self,
+      inFileOrDf: FilePathOrDf,
+      imShape: Tuple = None,
+      reindex=False,
+      parseErrorOk=False,
+      **importArgs
+  ):
     """
     Deserializes data from a file or string dataframe to create a S3A Component
     :class:`DataFrame`.
@@ -685,8 +746,10 @@ class ComponentIO:
       the index doesn't need to be retained.
     :return: Tuple: pd.DataFrame that will be exported if successful extraction
     """
+    fileName = None if isinstance(inFileOrDf, pd.DataFrame) else inFileOrDf
     field = PrjParam('None', None)
     serialDf = self._pandasSerialImport(inFileOrDf, **importArgs)
+    totalErrs = pd.DataFrame()
     if reindex:
       serialDf[RTF.INST_ID.name] = np.arange(len(serialDf), dtype=int)
       serialDf = serialDf.set_index(RTF.INST_ID.name, drop=False)
@@ -697,17 +760,25 @@ class ComponentIO:
       # Objects in the original frame are repre sented as strings, so try to convert these
       # as needed
       for field in self.tableData.allFields:
+        errs = []
         if field.name in serialDf:
           matchingCol = serialDf[field.name]
           # 'Object' type results in false positives
-          if matchingCol.dtype != object and type(field.value) == matchingCol.dtype:
-            outDf[field] = serialDf[field.name]
-          else:
-            # Parsing functions only know how to convert from strings to themselves.
-            # So, assume the exting types can first convert themselves to strings
-            with np.printoptions(threshold=sys.maxsize):
-              matchingCol = matchingCol.apply(str)
-            outDf[field] = _strSerToParamSer(matchingCol, field.value)
+          # if matchingCol.dtype != object and type(field.value) == matchingCol.dtype:
+          #   outDf[field] = serialDf[field.name]
+          # else:
+          # Parsing functions only know how to convert from strings to themselves.
+          # So, assume the exting types can first convert themselves to strings
+          matchingCol = matchingCol.astype(str)
+          outDf[field], errs = deserialize(field, matchingCol)
+          if len(errs):
+            totalErrs = totalErrs.join(errs, how='outer')
+      if len(totalErrs) and not parseErrorOk:
+        raise AnnParseError(
+            f'Encountered problems on some annotations:\n{totalErrs.to_string()}',
+            fileName=fileName,
+            instances=totalErrs
+        )
       outDf = outDf.set_index(RTF.INST_ID, drop=False)
 
       self.checkVertBounds(outDf[RTF.VERTICES], imShape)
@@ -726,7 +797,53 @@ class ComponentIO:
     """Exposed format from the more general importSerialized"""
     return self.importSerialized(*args, **kwargs)
 
-  def importGeojson(self, inFileOrDict: Union[FilePath, dict], parseErrorOk=False, **importArgs):
+  def _foreignSerialImport(
+      self,
+      foreignTbl: TableData,
+      foreignDf: pd.DataFrame,
+      mapping: dict = None,
+  ):
+    """
+    Several forms of imports / exports handle data that may not be compatible with the current table data.
+    In these cases, it is beneficial to determine a mapping between names to allow greater compatibility between
+    I/O formats. This also safely attempts a serial transfer without leaving self's table data in an unstable state.
+    Mapping is also extended in both directions by parameter name aliases (param.opts['aliases']), which are a list
+    of strings of common mappings for that parameter (e.g. [Class, Label] are often used interchangeably)
+
+    :param foreignTbl: Table of foreign information
+    :param foreignDf: Dataframe with maybe foreign fields
+    :param mapping: Foreign to local field name mapping
+    """
+    oldTbl = self.tableData
+    try:
+      self.tableData = foreignTbl
+      foreignDf = self.importSerialized(foreignDf)
+    finally:
+      self.tableData = oldTbl
+    outCols = list(foreignTbl.allFields)
+
+    for ii, field in enumerate(foreignTbl.allFields):
+      checkNames = set([field.name] + field.opts.get('aliases', []))
+      for cmp in oldTbl.allFields:
+        cmpNames = [cmp.name] + cmp.opts.get('aliases', [])
+        if checkNames & set(cmpNames):
+          # There's a match!
+          outCols[ii] = cmp
+
+    if mapping:
+      # Mapping takes priority, so let it overwrite potentially alias-mapped values
+      for kk, vv in mapping.items():
+        if vv in oldTbl and kk in outCols:
+          outCols[kk] = vv
+    foreignDf.columns = outCols
+    return foreignDf
+
+  def importGeojson(
+      self,
+      inFileOrDict: Union[FilePath, dict],
+      parseErrorOk=False,
+      **importArgs,
+  ):
     fileName = None
     if not isinstance(inFileOrDict, dict):
       fileName = Path(inFileOrDict)
@@ -741,22 +858,52 @@ class ComponentIO:
       else:
         badInsts.append(ann)
     if badInsts and not parseErrorOk:
-      raise AnnParseError(f'Currently, S3A only supports polygon geojson types',
-                          fileName=fileName, instances=badInsts)
+      raise AnnParseError(
+          f'Currently, S3A only supports polygon geojson types',
+          fileName=fileName,
+          instances=badInsts
+      )
     outDf = self.tableData.makeCompDf(len(verts))
     outDf[RTF.VERTICES] = verts
     return outDf
 
-  def importSuperannotateJson(self, inFileOrDict: Union[FilePath, dict], parseErrorOk=False, **importArgs):
+  def importSuperannotateJson(
+      self,
+      inFileOrDict: Union[FilePath, dict],
+      parseErrorOk=False,
+      srcDir: Union[FilePath, dict] = None,
+      **importArgs,
+  ):
+    """
+    :param inFileOrDict: File or object to import
+    :param parseErrorOk: Whether errors should be raised on bad annotation instances
+    :param srcDir: Folder path with 'classes.json' (usually this folder is called 'classes')
+      or dict with 'classes.json' key and dict value
+    """
     fileName = None
+
+    def readFunc(file):
+      with open(file, 'r') as ifile:
+        return json.load(ifile)
+
     if not isinstance(inFileOrDict, dict):
       fileName = Path(inFileOrDict)
-      with open(inFileOrDict, 'r') as ifile:
-        inFileOrDict = json.load(ifile)
+      inFileOrDict = readFunc(inFileOrDict)
+    foreignDf = pd.DataFrame(inFileOrDict['instances'])
+    if srcDir is None:
+      srcDir = Path(f'.')
+    srcDir = DirectoryDict(srcDir, readFunc=readFunc, allowAbsolute=True)
+    useTbl = self._getForeignTableData('superannotateJson')
+    classes = srcDir.get('classes.json')
+    if classes is None and fileName is not None:
+      classes = srcDir.get(fileName.parent / 'classes' / 'classes.json')
+    if classes is not None:
+      useTbl.fieldFromName('className').opts['limits'] = [c['name'] for c in classes]
     instances = inFileOrDict['instances']
     parsePts = []
     invalidInsts = []
-    for inst in instances:
+    invalidIdxs = []
+    for ii, inst in enumerate(instances):
       typ = inst['type']
       if typ in ['polygon', 'bbox']:
         pts = inst['points']
@@ -770,18 +917,29 @@ class ComponentIO:
         parsePts.append(orderContourPts(pts))
       else:
         invalidInsts.append(inst)
+        invalidIdxs.append(ii)
     if invalidInsts and not parseErrorOk:
-      raise AnnParseError('Currently, S3A only supports polygon annotations from SuperAnnotate',
-                          fileName=fileName, instances=invalidInsts)
-    outDf = self.tableData.makeCompDf(len(parsePts))
+      raise AnnParseError(
+          'Currently, S3A only supports polygon annotations from SuperAnnotate',
+          fileName=fileName,
+          instances=invalidInsts
+      )
+    foreignDf = foreignDf.drop(invalidIdxs)
+    outDf = self._foreignSerialImport(useTbl, foreignDf, importArgs.get('mapping'))
+
     outDf[RTF.VERTICES] = [ComplexXYVertices([pts], coerceListElements=True) for pts in parsePts]
     outDf[RTF.SRC_IMG_FILENAME] = inFileOrDict['metadata']['name']
     imShape = (inFileOrDict['metadata']['height'], inFileOrDict['metadata']['width'])
     self.checkVertBounds(outDf[RTF.VERTICES], imShape)
     return outDf
 
-  def importCompImgsDf(self, inFile: FilePath, imShape: Tuple=None,
-                          lblField='Instance ID', **importArgs):
+  def importCompImgsDf(
+      self,
+      inFile: FilePath,
+      imShape: Tuple = None,
+      lblField='Instance ID',
+      **importArgs,
+  ):
     lblField = self.tableData.fieldFromName(lblField)
     inDf = pd.read_pickle(inFile)
     outDf = self.tableData.makeCompDf(len(inDf))
@@ -792,14 +950,15 @@ class ComponentIO:
       mask = row.labelMask
       verts = ComplexXYVertices.fromBwMask(mask)
       offset = row.offset
-      for v in verts: v += offset
+      for v in verts:
+        v += offset
       allVerts.append(verts)
     outDf[RTF.VERTICES] = allVerts
     outDf[lblField] = inDf['label']
     self.checkVertBounds(outDf[RTF.VERTICES], imShape)
     return outDf
 
-  def importPkl(self, inFile: FilePath, imShape: Tuple=None, **importArgs) -> pd.DataFrame:
+  def importPkl(self, inFile: FilePath, imShape: Tuple = None, **importArgs) -> pd.DataFrame:
     """
     See docstring for :func:`self.importCsv`
     """
@@ -809,12 +968,15 @@ class ComponentIO:
     templateDf.update(pklDf)
     return templateDf
 
-  def importLblPng(self, inFileOrImg: Union[FilePath, GrayImg],
-                      lblField: Union[str, PrjParam]=None,
-                      lblMapping: pd.Series=None,
-                      distinctRegions=True,
-                      offset=0,
-                      **importArgs) -> pd.DataFrame:
+  def importLblPng(
+      self,
+      inFileOrImg: Union[FilePath, GrayImg],
+      lblField: Union[str, PrjParam] = None,
+      lblMapping: pd.Series = None,
+      distinctRegions=True,
+      offset=0,
+      **importArgs
+  ) -> pd.DataFrame:
     """
     Build dataframe from label image
 
@@ -848,7 +1010,7 @@ class ComponentIO:
     allVerts = []
     lblField_out = []
     for numericLbl, origVal in lblMapping.iteritems():
-      origVal: np.number # silence warning
+      origVal: np.number  # silence warning
       verts = ComplexXYVertices.fromBwMask(labelImg == numericLbl)
       if distinctRegions:
         newRegions = [ComplexXYVertices([v]) for v in verts]
@@ -884,9 +1046,11 @@ class ComponentIO:
     vertMaxs = np.vstack(vertMaxs)
     offendingIds = np.nonzero(np.any(vertMaxs > imShape, axis=1))[0]
     if len(offendingIds) > 0:
-      warnLater(f'Vertices on some components extend beyond image dimensions. '
-           f'Perhaps this export came from a different image?\n'
-           f'Offending IDs: {offendingIds}', UserWarning)
+      warnLater(
+          f'Vertices on some components extend beyond image dimensions. '
+          f'Perhaps this export came from a different image?\n'
+          f'Offending IDs: {offendingIds}', UserWarning
+      )
 
   def _idImgToDf(self, idImg: GrayImg):
     # Skip 0 since it's indicative of background
@@ -898,7 +1062,7 @@ class ComponentIO:
       allVerts.append(verts)
     outDf = self.tableData.makeCompDf(regionIds.size)
     # Subtract 1 since instance ids are 0-indexed
-    outDf[RTF.INST_ID] = regionIds-1
+    outDf[RTF.INST_ID] = regionIds - 1
     outDf[RTF.VERTICES] = allVerts
     return outDf
 

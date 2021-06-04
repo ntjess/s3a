@@ -10,9 +10,8 @@ from skimage.measure import regionprops, label
 from skimage.morphology import flood
 
 from s3a.generalutils import cornersToFullBoundary, getCroppedImg, imgCornerVertices, \
-  showMaskDiff, MaxSizeDict, tryCvResize
+  showMaskDiff, tryCvResize
 from s3a.structures import BlackWhiteImg, XYVertices, ComplexXYVertices, NChanImg, GrayImg
-from s3a.shims import typing_extensions as te
 from utilitys import fns
 from utilitys.processing import *
 
@@ -258,7 +257,7 @@ def apply_process_result(image: NChanImg, asForeground: bool,
 
   # Add 1 to max slice so stopping value is last foreground pixel
   newSlices = (slice(mins[0], maxs[0]+1), slice(mins[1], maxs[1]+1))
-  return ProcessIO(image=outMask[newSlices], boundSlices=newSlices, info={'image': change})
+  return ProcessIO(image=outMask[newSlices], boundSlices=newSlices, summaryInfo={'image': change})
 
 def return_to_full_size(image: NChanImg, origCompMask: BlackWhiteImg,
                         boundSlices: Tuple[slice]):
