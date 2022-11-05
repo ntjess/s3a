@@ -17,3 +17,6 @@ menuopts
 # Auto-generated test files
 /apptests/files/*.png
 .coverage
+
+# Documentation Generation
+/docs/build
